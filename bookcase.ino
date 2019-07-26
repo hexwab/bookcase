@@ -12,11 +12,19 @@
 #define BRIGHT_DELAY	500 // ms
 #define BRIGHT_SPEED    3 // higher==slower
 
+// fade tweakables
 #define FADE_ON_SPEED	8 // higher==slower
 #define FADE_OFF_SPEED	8 // higher==slower
 
-//#define RAINBOW_SPREAD	6
-//#define RAINBOW_SPEED	8
+// rollup tweakables
+#define SMOOTH_WIDTH 2.5 // width of transition region, in lines
+
+// rainbow tweakables
+#define RAINBOW_SPREAD	12
+#define RAINBOW_SPEED	7
+#define RAINBOW_OFF_SPEED  10 // higher==slower
+#define RAINBOW_START 250
+#define RAINBOW_END   350
 
 
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(LED_COUNT, PIN_LED, NEO_GRBW + NEO_KHZ800);
@@ -33,7 +41,7 @@ enum anim_t {
     ANIM_SET_BRIGHT,
 } anim = ANIM_NONE;
 
-uint32_t now=0, animstart=0, brightframe=224<<BRIGHT_SPEED;
+uint32_t now=0, animstart=0, brightframe;
 
 void setup() {
     Serial.begin(115200);
@@ -41,7 +49,7 @@ void setup() {
     pinMode(PIN_SWITCH, INPUT);
     strip.begin();
     strip.show(); // all off
-    strip.setBrightness(255);
+    set_bright(223);
 }
 
 #define NTRIES 5 // ~15ms
@@ -90,8 +98,17 @@ void anim_done() {
 	anim = ANIM_NONE;
     }
 }
+
+void set_bright(int b) {
+    //bright = b;
+    strip.setBrightness(strip.gamma8(b+32));
+    brightframe = 224 << BRIGHT_SPEED;
+}
+
+
 #define max(a,b) ((a>b)?(b):(a))
 #define min(a,b) ((a<b)?(b):(a))
+#define clamp(x,minval,maxval) max(min(x,minval),maxval)
 
 static inline int boustrophedon(int x, int stride) {
     int y = x / stride,
@@ -101,35 +118,104 @@ static inline int boustrophedon(int x, int stride) {
     return n;
 }
 
+/* smooth transition from 0 when x<edge0 to 255 when x>edge0+width */
+static inline int smoothstep(int x, int edge0, int width) {
+    // scale, bias, saturate
+    x = clamp((x - edge0) * 256 / width, 0, 256);
+
+    return (x * x * (767 - 2*x))>>16;
+}
+
+#define gammaw(whiteval) strip.Color(0,0,0,strip.gamma8(whiteval))
+
+#define fill_all(whiteval) do { 		\
+	strip.fill(gammaw(whiteval));		\
+    } while (0)
+
+#define fill_line(whiteval,line) do {				\
+	strip.fill(gammaw(whiteval), line*LINE_LEN,LINE_LEN);	\
+    } while (0)
+
+static inline uint32_t mix(uint32_t a, uint32_t b, int frac) {
+    frac = clamp(frac, 0, 256);
+    union {
+	uint32_t c;
+	struct {
+	    uint8_t c0, c1, c2, c3;
+	};
+    } aa = { .c = a },
+      bb = { .c = b },
+      out;
+
+    out.c0 = ((aa.c0 * frac) + (bb.c0 * (256-frac))) >> 8;
+    out.c1 = ((aa.c1 * frac) + (bb.c1 * (256-frac))) >> 8;
+    out.c2 = ((aa.c2 * frac) + (bb.c2 * (256-frac))) >> 8;
+    out.c3 = ((aa.c3 * frac) + (bb.c3 * (256-frac))) >> 8;
+    return out.c;
+}
+
+typedef bool (*animfunc(int));
+/* const animfunc funcs[] = { */
+/*     animate_fade_in, */
+/*     animate_fade_up, */
+/* }; */
+
+/* on animations. these should leave all the LEDs at full white (0,0,0,255) */
+bool animate_on_fade(int f) {
+    f = (f<<8) >> FADE_ON_SPEED;
+    fill_all(max(f,255));
+    return f>255;
+}
+
+bool animate_on_rollup(int f) {
+    f = (f<<8) >> FADE_ON_SPEED;
+    for (int i=0; i<LINES; i++) {
+	fill_line(smoothstep(f, i<<8, SMOOTH_WIDTH*256), i);
+    }
+    return f>(((LINES-1)<<8)+SMOOTH_WIDTH*256);
+}
+
+/* off animations. these should leave all the LEDs dark (0,0,0,0) */
+bool animate_off_fade(int f) {
+    f = (f<<8) >> FADE_OFF_SPEED;
+    fill_all(255-max(f,255));
+    return f>255;
+}
+
+bool animate_off_rainbow(int f) {
+f = (f<<8) >> RAINBOW_OFF_SPEED;
+    for (int i=0; i<LED_COUNT; i++) {
+        uint32_t col = strip.gamma32(strip.ColorHSV((f<<RAINBOW_SPEED) + (i<<RAINBOW_SPREAD))),
+	    white = strip.Color(0,0,0,255),
+	    black = strip.Color(0,0,0,0),
+	    mixed = mix (white,
+		  mix(col, black,
+		      smoothstep(i, f-RAINBOW_END, 256)),
+			     smoothstep(i, f-RAINBOW_START, 256));
+
+	strip.setPixelColor(boustrophedon(LED_COUNT-i-1, LINE_LEN), mixed);
+     }
+return f>1000; // FIXME
+}
+
 void set_leds(void) {
     uint32_t f = now-animstart;
     switch (anim) {
     case ANIM_TURN_ON:
-	f = (f<<8) >> FADE_ON_SPEED;
-	strip.fill(strip.Color(0,0,0,strip.gamma8(max(f,255))));
-	if (f>255)
+    if (animate_on_rollup(f))
 	    anim_done();
 	break;
     case ANIM_TURN_OFF:
-	{
-	    //for (int x=0; x<LINE_LEN; x++) {
-	    //	for (int y=0; y<LINES; y++) {
-	    //for (int i=0; i<10; i++) {
-	    //strip.setPixelColor(i, strip.gamma32(strip.ColorHSV((f<<RAINBOW_SPEED)+(i<<RAINBOW_SPREAD))));
-	    //}
-	    f = (f<<8) >> FADE_OFF_SPEED;
-	    strip.fill(strip.Color(0,0,0,strip.gamma8(255-max(f,255))));
-	    if (f>255)
-		anim_done();
-	}
+    if (animate_off_rainbow(f))
+	    anim_done();
 	break;
     case ANIM_SET_BRIGHT:
 	{
 	    anim_done();
 	    int bright = boustrophedon(f >> BRIGHT_SPEED, 224) %224;
-	    strip.setBrightness(strip.gamma8(bright+32));
+	    set_bright(bright);
 	    //Serial.println("jkl");
-	    strip.fill(strip.Color(0, 0, 0, 255), 0, LINES*LINE_LEN);
+	    strip.fill(strip.Color(0, 0, 0, 255));
 	    brightframe = f;
 	    break;
 	}
@@ -148,6 +234,7 @@ void loop() {
 	switch (state) {
 	case STATE_OFF:
 	    // when off, switch on as soon as button is touched
+	    set_bright(223); // reset to max brightness
 	    set_state(STATE_ON, ANIM_TURN_ON);
 	    break;
 	case STATE_ON:
